@@ -256,10 +256,8 @@ object LlapRelation {
       iterator: Iterator[(NullWritable, org.apache.hadoop.hive.llap.Row)]): Iterator[Row] = {
     val llapInputSplit = inputSplit.asInstanceOf[LlapInputSplit]
     val schema: Schema = llapInputSplit.getSchema
-    iterator.map((tuple) => {
-      val row = RowConverter.llapRowToSparkRow(tuple._2, schema)
-      row
-    })
+    val converter = RowConverter.makeConverter(schema)
+    iterator.map(tuple => converter(tuple._2))
   }
 }
 

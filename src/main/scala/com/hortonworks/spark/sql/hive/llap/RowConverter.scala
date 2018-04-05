@@ -26,48 +26,80 @@ import org.apache.hadoop.hive.serde2.typeinfo._
 import org.apache.spark.sql.Row
 
 object RowConverter {
+  type ValueConverter = Any => Any
 
-  def llapRowToSparkRow(llapRow: org.apache.hadoop.hive.llap.Row, schema: Schema): Row = {
-    val fields = new ArrayBuffer[Any](schema.getColumns.size)
-    val iterator = schema.getColumns.iterator()
-    var idx = 0
-    while(iterator.hasNext) {
-      val colDesc = iterator.next()
-      fields += convertValue(llapRow.getValue(idx), colDesc.getTypeInfo)
-      idx += 1
+  def makeConverter(schema: Schema): org.apache.hadoop.hive.llap.Row => Row = {
+    val fieldConverters = schema.getColumns.asScala.map { colDesc =>
+      makeValueConverter(colDesc.getTypeInfo)
+    }.toArray
+
+    (llapRow: org.apache.hadoop.hive.llap.Row) => {
+      val fields = new ArrayBuffer[Any](fieldConverters.length)
+      var idx = 0
+      while (idx < fieldConverters.length) {
+        fields += fieldConverters(idx)(llapRow.getValue(idx))
+        idx += 1
+      }
+      Row.fromSeq(fields)
     }
-
-    Row.fromSeq(fields)
   }
 
-  private def convertValue(value: Any, colType: TypeInfo): Any = {
-    if (value == null) {
-      null
-    } else {
-      colType.getCategory match {
-        // The primitives should not require conversion
-        case Category.PRIMITIVE => value
-        case Category.LIST => value.asInstanceOf[java.util.List[Any]].asScala.map(
-          listElement => convertValue(
-              listElement,
-              colType.asInstanceOf[ListTypeInfo].getListElementTypeInfo))
-        case Category.MAP =>
+  private def makeValueConverter(colType: TypeInfo): ValueConverter = {
+    colType.getCategory match {
+      // The primitives should not require conversion
+      case Category.PRIMITIVE =>
+        (value: Any) => if (value == null) {
+          null
+        } else {
+          value
+        }
+
+      case Category.LIST =>
+        val elementConverter = makeValueConverter(colType.asInstanceOf[ListTypeInfo].getListElementTypeInfo)
+
+        (value: Any) => if (value == null) {
+          null
+        } else {
+          value.asInstanceOf[java.util.List[Any]].asScala.map { listElement =>
+            elementConverter(listElement)
+          }
+        }
+
+      case Category.MAP =>
+        val keyConverter = makeValueConverter(colType.asInstanceOf[MapTypeInfo].getMapKeyTypeInfo)
+        val valueConverter = makeValueConverter(colType.asInstanceOf[MapTypeInfo].getMapValueTypeInfo)
+
+        (value: Any) => if (value == null) {
+          null
+        } else {
           // Try LinkedHashMap to preserve order of elements - is that necessary?
-          var map = scala.collection.mutable.LinkedHashMap.empty[Any, Any]
-          value.asInstanceOf[java.util.Map[Any, Any]].asScala.foreach((tuple) =>
-            map(convertValue(tuple._1, colType.asInstanceOf[MapTypeInfo].getMapKeyTypeInfo)) =
-              convertValue(tuple._2, colType.asInstanceOf[MapTypeInfo].getMapValueTypeInfo))
+          val map = scala.collection.mutable.LinkedHashMap.empty[Any, Any]
+          value.asInstanceOf[java.util.Map[Any, Any]].asScala.foreach { case (k, v) =>
+            map(keyConverter(k)) = valueConverter(v)
+          }
           map
-        case Category.STRUCT =>
+        }
+
+      case Category.STRUCT =>
+        val fieldConverters = colType.asInstanceOf[StructTypeInfo]
+          .getAllStructFieldTypeInfos.asScala.map(makeValueConverter).toArray
+
+        (value: Any) => if (value == null) {
+          null
+        } else {
           // Struct value is just a list of values. Convert each value based on corresponding
           // typeinfo
-          Row.fromSeq(
-            colType.asInstanceOf[StructTypeInfo].getAllStructFieldTypeInfos.asScala.zip(
-              value.asInstanceOf[java.util.List[Any]].asScala).map({
-                case (fieldType, fieldValue) => convertValue(fieldValue, fieldType)
-              }))
-        case _ => null
-      }
+          val fields = new ArrayBuffer[Any](fieldConverters.length)
+          val values = value.asInstanceOf[java.util.List[Any]].asScala
+          var idx = 0
+          while (idx < fieldConverters.length) {
+            fields += fieldConverters(idx)(values(idx))
+            idx += 1
+          }
+          Row.fromSeq(fields)
+        }
+
+      case _ => (value: Any) => null
     }
   }
 }
